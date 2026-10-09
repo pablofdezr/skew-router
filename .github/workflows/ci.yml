@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: gofmt -l . | (! grep .)
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - run: bash -n examples/web-version.sh && shellcheck -S warning examples/web-version.sh
+      # Docker Hub's token endpoint sometimes answers 504; retry instead of failing the run.
+      - name: docker build
+        run: |
+          for i in 1 2 3; do
+            docker build -t skew-router . && exit 0
+            echo "build failed (attempt $i), retrying in 20 s"; sleep 20
+          done
+          exit 1

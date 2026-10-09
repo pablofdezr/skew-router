@@ -1,0 +1,24 @@
+# Traefik file-provider services: the router while it passes its health check, the web pods
+# directly (web-fallback) when no router replica does. Version pinning is lost meanwhile; the site
+# stays up. Point your router (IngressRoute or labels) at web-entry@file.
+http:
+  services:
+    web-entry:
+      failover:
+        service: web-router
+        fallback: web-direct
+    web-router:
+      loadBalancer:
+        passHostHeader: true
+        healthCheck:
+          path: /readyz
+          port: 9090
+          interval: 2s
+          timeout: 1s
+        servers:
+          - url: http://skew-router.web.svc.cluster.local:8080
+    web-direct:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: http://web-fallback.web.svc.cluster.local:3000

@@ -1,0 +1,83 @@
+# One web version: a Deployment + Service per build, named web-<id> and labelled with the build's
+# deployment id. web-version.sh fills the __PLACEHOLDERS__ and applies it. Adapt the container
+# (env, probes, resources) to your app; keep the labels and the two annotations.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __NAME__
+  namespace: __NAMESPACE__
+  labels:
+    app: web
+    __PREFIX__/version: "__VERSION__"
+  annotations:
+    __PREFIX__/promoted-at: "__PROMOTED_AT__"
+    __PREFIX__/revokes-older: "__REVOKES_OLDER__"
+spec:
+  replicas: __REPLICAS__
+  revisionHistoryLimit: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: web
+      __PREFIX__/version: "__VERSION__"
+  template:
+    metadata:
+      labels:
+        app: web
+        __PREFIX__/version: "__VERSION__"
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: web
+          image: __IMAGE__
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: HOSTNAME
+              value: "0.0.0.0"
+          # Endpoint removal reaches the router before the pod stops accepting connections.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+---
+# The router proxies to this Service; its annotations hold the retention timers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: __NAME__
+  namespace: __NAMESPACE__
+  labels:
+    app: web
+    __PREFIX__/version: "__VERSION__"
+  annotations:
+    __PREFIX__/promoted-at: "__PROMOTED_AT__"
+    __PREFIX__/revokes-older: "__REVOKES_OLDER__"
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+    __PREFIX__/version: "__VERSION__"
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http

@@ -1,0 +1,233 @@
+# skew-router: skew protection for a self-hosted Next.js app.
+#
+#   ingress ──▶ Service skew-router:8080 ──▶ Service web-<id>:3000 (one per web build)
+#
+# A browser tab keeps talking to the web build that served it (it sends that build's id in
+# `x-deployment-id` / `?dpl=`); document navigations and ids of retired builds go to the ACTIVE
+# build, an explicit pointer kept in ConfigMap `web-routing`. The router discovers the versions
+# by label (web-version.yaml), moves the pointer to a newly promoted version once it has ready
+# endpoints (never to one without), and applies retention: the previous version stays routable
+# for -version-ttl after it stopped being active, then is scaled to 0 but kept (instant
+# rollback); anything beyond -max-versions is deleted. A version annotated revokes-older=true
+# revokes every older one the moment it is active and ready.
+#
+# Every replica routes from cluster state alone; one (Lease leader election) writes the pointer
+# and the timers. RBAC is namespace-scoped and minimal. Kubernetes can't restrict a write to
+# objects with a label, so the router enforces it in code: it only patches or deletes a
+# Deployment/Service that carries the version label with the expected id, pinned to the UID it
+# checked.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: skew-router
+  namespace: web
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: skew-router
+  namespace: web
+rules:
+  # Version Services: discover, annotate (retention timers), delete.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+  # Version Deployments: scale to 0 (patch), delete.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch", "delete"]
+  # The pointer. resourceNames can't scope `create`; everything else is
+  # limited to this one ConfigMap (the informer lists it by name).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["web-routing"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  # Leader election.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["skew-router"]
+    verbs: ["get", "update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: skew-router
+  namespace: web
+subjects:
+  - kind: ServiceAccount
+    name: skew-router
+    namespace: web
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: skew-router
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skew-router
+  namespace: web
+  labels:
+    app: skew-router
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: skew-router
+  template:
+    metadata:
+      labels:
+        app: skew-router
+    spec:
+      serviceAccountName: skew-router
+      # One replica per node when there are several (soft: on a single
+      # node both still run there).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: skew-router
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: skew-router
+      # preStop (5s, endpoint removal reaches Traefik) + the router's own
+      # shutdown delay (3s) + up to 20s for in-flight requests.
+      terminationGracePeriodSeconds: 35
+      containers:
+        - name: skew-router
+          # Build it from this repo: docker build -t <your-registry>/skew-router:v0.1.0 .
+          image: skew-router:v0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --version-ttl=1h
+            - --max-versions=2
+            - --drain=10s
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Leader election identity.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GOMEMLIMIT
+              value: "100MiB"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9090
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: skew-router
+  namespace: web
+  labels:
+    app: skew-router
+spec:
+  type: ClusterIP
+  selector:
+    app: skew-router
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    # Traefik health-checks the router here (/readyz) and fails over to
+    # web-fallback when no replica answers (see traefik-failover.yml).
+    - name: admin
+      port: 9090
+      targetPort: admin
+      protocol: TCP
+---
+# Plan B when every skew-router replica is down: Traefik sends traffic straight
+# to the web pods (all versions alive, so a tab may land on another build —
+# Next then reloads it). Never a router version: no version label, so the
+# router ignores it, and nothing routes here while the router is healthy.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-fallback
+  namespace: web
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: skew-router
+  namespace: web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: skew-router
