@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -16,9 +17,14 @@ import (
 //   - for every route template (the site's own routes: the catch-all, a static-assets route with
 //     its own rate limit, a route for internal clients…), a default router with the template's
 //     rule, priority and middlewares, pointing at the serving version;
-//   - for every routable version and every template, a pinned router: the template's rule AND
-//     the version's id in the x-deployment-id header or ?dpl=, one priority above the default,
-//     same middlewares, pointing straight at that version's Service;
+//   - for every other routable version and every template, a pinned router: the template's rule
+//     AND the version's id in the x-deployment-id header or ?dpl=, one priority above the
+//     default, same middlewares, pointing straight at that version's Service. The serving
+//     version gets none: the default router already sends its requests there, and leaving it
+//     out keeps those requests on the default router's middleware instances. Traefik builds a
+//     middleware per router, so in-memory rate limits count per router: with a pinned router
+//     for the serving version, a browser on the current build would split its requests across
+//     two buckets. This way only tabs on an older build (for its routable hour) count apart;
 //   - a service "<prefix>-active" any other route can use (`skew-active@http`), e.g. a redirect.
 //
 // Requests go Traefik → version with no extra hop. A retired or revoked id has no pinned router,
@@ -143,6 +149,9 @@ func TraefikConfig(r *Routes, c RoutesConfig) traefikDynamic {
 		}
 	}
 	sort.Strings(ids)
+	if serving != nil { // no pinned router or service for the serving version (see above)
+		ids = slices.DeleteFunc(ids, func(id string) bool { return id == serving.ID })
+	}
 	out.HTTP.Services[active] = service(serving)
 	for _, id := range ids {
 		out.HTTP.Services[c.Prefix+"-v-"+nameUnsafe.ReplaceAllString(id, "-")] = service(r.byID[id])

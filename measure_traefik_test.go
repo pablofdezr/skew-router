@@ -119,6 +119,7 @@ func TestMeasureTraefik(t *testing.T) {
 		{"/_next/static/chunk.js?dpl=old111", nil, "old", "static", "pinned asset → its version, static middleware"},
 		{"/_next/static/chunk.js", nil, "new", "static", "unpinned asset → active, static middleware"},
 		{"/", map[string]string{DeploymentIDHeader: "gone99"}, "new", "web", "unknown id → active"},
+		{"/", map[string]string{DeploymentIDHeader: "new222"}, "new", "web", "the active build's own id → active, default router"},
 	} {
 		res, err := get("app.test", c.path, c.hdr)
 		if err != nil {

@@ -61,11 +61,21 @@ routes once, in a JSON file (`-routes`), exactly as you'd write them in Traefik:
 For each template skew-router generates:
 
 - **a default router:** the template's rule, priority and middlewares, to the active version;
-- **a pinned router per routable version:** the template's rule AND the version's id (header or
-  `?dpl=`), at priority + 1, with the **same middlewares**, straight to that version.
+- **a pinned router per other routable version:** the template's rule AND the version's id
+  (header or `?dpl=`), at priority + 1, with the **same middlewares**, straight to that version.
+  The serving version gets none, since the default router already sends its requests there.
 
 So a pinned request keeps exactly the protection its template gives it: a pinned `/_next/static`
-chunk still gets the static route's rate limit. Keep template priorities at least 2 apart, so a
+chunk still gets the static route's rate limit.
+
+**Rate limits count per router.** Traefik builds a middleware instance per router, and an
+in-memory `rateLimit` keeps its buckets per instance. Leaving out the serving version's pinned
+router keeps a browser on the current build on one bucket per template, as without skew
+protection. A tab on an older build counts apart while that build is routable, so a client
+mixing ids can get up to 2× a limit for the hour after a deploy (with `-max-versions=2`). For
+an exact limit, give the middleware Traefik's `redis` backend: its key is the middleware's
+name and the source, without the router, so every router shares one bucket. Traefik answers
+500 while it can't reach that Redis. Keep template priorities at least 2 apart, so a
 pinned router never ties or overtakes the next template (the router refuses a file that doesn't).
 
 It also serves a service `skew-active` (referenced from other providers as `skew-active@http`)

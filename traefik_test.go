@@ -25,8 +25,9 @@ func TestTraefikConfig(t *testing.T) {
 	rc := testRoutes()
 
 	c := TraefikConfig(r, rc)
-	// 3 templates × (default + 2 pinned) = 9 routers; services: active + one per version.
-	if len(c.HTTP.Routers) != 9 || len(c.HTTP.Services) != 3 {
+	// 3 templates × (default + 1 pinned: the serving version has none) = 6 routers;
+	// services: active + one per other version.
+	if len(c.HTTP.Routers) != 6 || len(c.HTTP.Services) != 2 {
 		t.Fatalf("routers %d services %d", len(c.HTTP.Routers), len(c.HTTP.Services))
 	}
 	def := c.HTTP.Routers["skew-static"]
@@ -42,7 +43,11 @@ func TestTraefikConfig(t *testing.T) {
 	if c.HTTP.Routers["skew-static-old111"].Priority >= c.HTTP.Routers["skew-trusted"].Priority {
 		t.Fatal("a pinned static router overtook the trusted route")
 	}
-	if w := c.HTTP.Routers["skew-web-new222"]; w.TLS == nil || w.EntryPoints[0] != "websecure" {
+	// The serving version's requests stay on the default router (one rate-limit bucket).
+	if _, ok := c.HTTP.Routers["skew-web-new222"]; ok {
+		t.Fatal("the serving version must not get a pinned router")
+	}
+	if w := c.HTTP.Routers["skew-web-old111"]; w.TLS == nil || w.EntryPoints[0] != "websecure" {
 		t.Fatalf("pinned router lost TLS/entrypoints: %+v", w)
 	}
 	if got := c.HTTP.Services["skew-v-old111"].LoadBalancer.Servers[0].URL; got != "http://10.43.0.11:3000" {
