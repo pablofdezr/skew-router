@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -9,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -147,7 +147,7 @@ func newHarness(t *testing.T, at time.Time, versions ...version) *harness {
 		Log:     log,
 		Metrics: m,
 	}
-	h.router = httptest.NewServer(NewProxy(h.ctrl.Routes, m, log))
+	h.router = httptest.NewServer(pickProxy(h.ctrl.Routes))
 	t.Cleanup(h.router.Close)
 	return h
 }
@@ -265,62 +265,6 @@ func TestEndToEndRouting(t *testing.T) {
 	t.Run("unknown id goes to the active version", func(t *testing.T) {
 		if v := h.get("/_next/static/x.js?dpl=nope", nil); v != "new" {
 			t.Fatalf("got %q, want new", v)
-		}
-	})
-	t.Run("host and forwarded headers are preserved", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, h.router.URL+"/", nil)
-		req.Host = "www.example.com"
-		req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.42.0.1")
-		req.Header.Set("X-Forwarded-Proto", "https")
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, _ := io.ReadAll(res.Body)
-		res.Body.Close()
-		want := "host=www.example.com xff=203.0.113.7, 10.42.0.1 proto=https"
-		if string(body) != want {
-			t.Fatalf("upstream saw %q, want %q", body, want)
-		}
-	})
-	t.Run("streaming responses are flushed through", func(t *testing.T) {
-		res, err := http.Get(h.router.URL + "/stream")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer res.Body.Close()
-		br := bufio.NewReader(res.Body)
-		got := make(chan string, 1)
-		go func() { line, _ := br.ReadString('\n'); got <- line }()
-		select {
-		case line := <-got:
-			if line != "first-new\n" {
-				t.Fatalf("first chunk = %q", line)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("first chunk not flushed before the upstream finished")
-		}
-	})
-	t.Run("websocket upgrade is tunnelled to the pinned version", func(t *testing.T) {
-		conn, err := net.Dial("tcp", strings.TrimPrefix(h.router.URL, "http://"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer conn.Close()
-		fmt.Fprint(conn, "GET /ws?dpl=old111 HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-		br := bufio.NewReader(conn)
-		res, err := http.ReadResponse(br, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if res.StatusCode != http.StatusSwitchingProtocols {
-			t.Fatalf("status = %d", res.StatusCode)
-		}
-		fmt.Fprint(conn, "ping\n")
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		line, err := br.ReadString('\n')
-		if err != nil || line != "old:ping\n" {
-			t.Fatalf("echo = %q, %v", line, err)
 		}
 	})
 	t.Run("leader records superseded-at on the Service", func(t *testing.T) {
@@ -585,4 +529,23 @@ func TestLeaderElectionPicksOneReplica(t *testing.T) {
 	if err != nil || lease.Spec.HolderIdentity == nil {
 		t.Fatalf("lease not held: %v", err)
 	}
+}
+
+// pickProxy stands in for Traefik in these tests: it sends each request where the generated
+// routes would (Pick is the same decision: the id from the header or ?dpl=, a pinned version if
+// it is routable, the serving one otherwise, 503 with none). TestMeasureTraefik checks the
+// generated routes against a real Traefik.
+func pickProxy(routes func() *Routes) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v, _ := routes().Pick(deploymentID(r))
+		if v == nil {
+			http.Error(w, "no web version available", http.StatusServiceUnavailable)
+			return
+		}
+		rp := &httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(v.Upstream)
+			pr.Out.Host = pr.In.Host
+		}}
+		rp.ServeHTTP(w, r)
+	})
 }

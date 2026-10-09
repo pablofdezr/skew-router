@@ -8,7 +8,8 @@ import (
 	"sync/atomic"
 )
 
-// Outcome is how the proxy chose a version for one request.
+// Outcome is how a request with a given id is routed (Routes.Pick); the generated Traefik
+// routes encode the same decision.
 type Outcome int
 
 const (
@@ -27,7 +28,6 @@ func (o Outcome) String() string { return outcomeNames[o] }
 // Metrics is a tiny Prometheus text-format exporter; the handful of
 // series here doesn't justify the client library.
 type Metrics struct {
-	requests [numOutcomes]atomic.Uint64
 	Retired  atomic.Uint64
 	Revoked  atomic.Uint64
 	routable atomic.Int64
@@ -36,7 +36,6 @@ type Metrics struct {
 	active string
 }
 
-func (m *Metrics) Inc(o Outcome)     { m.requests[o].Add(1) }
 func (m *Metrics) SetRoutable(n int) { m.routable.Store(int64(n)) }
 
 func (m *Metrics) SetActive(name string) {
@@ -51,11 +50,6 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (m *Metrics) write(w io.Writer) {
-	fmt.Fprintln(w, "# HELP skew_router_requests_total Proxied requests by how the web version was chosen.")
-	fmt.Fprintln(w, "# TYPE skew_router_requests_total counter")
-	for o := Outcome(0); o < numOutcomes; o++ {
-		fmt.Fprintf(w, "skew_router_requests_total{outcome=%q} %d\n", o.String(), m.requests[o].Load())
-	}
 	fmt.Fprintln(w, "# HELP skew_router_versions_routable Web versions currently receiving traffic.")
 	fmt.Fprintln(w, "# TYPE skew_router_versions_routable gauge")
 	fmt.Fprintf(w, "skew_router_versions_routable %d\n", m.routable.Load())

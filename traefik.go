@@ -1,36 +1,93 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
 )
 
-// Traefik mode (-mode=traefik): the router stops carrying traffic. Instead it serves, on its
-// admin port, the dynamic configuration for Traefik's HTTP provider, built from the same routing
-// table the proxy reads:
+// skew-router carries no traffic. It serves, on its admin port, the dynamic configuration for
+// Traefik's HTTP provider (GET /traefik), built from the routing table:
 //
-//   - one router per routable version, matching its id in the x-deployment-id header or the
-//     ?dpl= query parameter, pointing straight at that version's Service;
-//   - one default router, lower priority, for everything else (no id, a retired or revoked id),
-//     pointing at the serving version;
-//   - with no version ready, the default router points at a service with no servers, so Traefik
-//     answers 503, the same as the proxy does.
+//   - for every route template (the site's own routes: the catch-all, a static-assets route with
+//     its own rate limit, a route for internal clients…), a default router with the template's
+//     rule, priority and middlewares, pointing at the serving version;
+//   - for every routable version and every template, a pinned router: the template's rule AND
+//     the version's id in the x-deployment-id header or ?dpl=, one priority above the default,
+//     same middlewares, pointing straight at that version's Service;
+//   - a service "<prefix>-active" any other route can use (`skew-active@http`), e.g. a redirect.
 //
-// Requests then go Traefik → version with no extra hop. Pointer moves, retention and revocation
-// work as before; they show up in Traefik on its next poll of /traefik. Every replica serves the
-// same configuration (it comes from the same pure plan), and if every replica is down Traefik
-// keeps the last configuration it fetched, so routing goes on, frozen, until one is back.
+// Requests go Traefik → version with no extra hop. A retired or revoked id has no pinned router,
+// so it falls through to the default one, and with no version ready the services have no
+// servers: Traefik answers 503. Every replica serves the same configuration (it comes from the
+// same pure plan), and if every replica is down Traefik keeps the last one it fetched.
+//
+// Pinned routers sit at priority+1, so leave a gap of at least 2 between template priorities.
 
-// TraefikOptions shape the routers: which requests they cover and how Traefik serves them.
-type TraefikOptions struct {
-	Rule         string   // the site's own match, e.g. Host(`www.example.com`); required
-	EntryPoints  []string // e.g. websecure
-	Middlewares  []string // e.g. security-headers@file
-	CertResolver string   // e.g. le; empty = no tls block
-	TLS          bool     // tls: {} with the default certificate when no resolver is set
-	Prefix       string   // router and service name prefix
+// RouteTemplate is one of the site's routes, as you'd write it in Traefik.
+type RouteTemplate struct {
+	Name        string         `json:"name"`
+	Rule        string         `json:"rule"`
+	Priority    int            `json:"priority"`
+	EntryPoints []string       `json:"entryPoints,omitempty"`
+	Middlewares []string       `json:"middlewares,omitempty"`
+	TLS         map[string]any `json:"tls,omitempty"`
+}
+
+// RoutesConfig is the -routes file.
+type RoutesConfig struct {
+	Prefix string          `json:"prefix,omitempty"` // router and service name prefix (default skew)
+	Routes []RouteTemplate `json:"routes"`
+}
+
+var templateName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
+
+// LoadRoutes reads and validates a -routes file.
+func LoadRoutes(path string) (RoutesConfig, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return RoutesConfig{}, err
+	}
+	var c RoutesConfig
+	if err := json.Unmarshal(b, &c); err != nil {
+		return c, fmt.Errorf("%s: %w", path, err)
+	}
+	return c, c.validate()
+}
+
+func (c *RoutesConfig) validate() error {
+	if c.Prefix == "" {
+		c.Prefix = "skew"
+	}
+	if !templateName.MatchString(c.Prefix) {
+		return fmt.Errorf("prefix %q: lowercase letters, digits and dashes", c.Prefix)
+	}
+	if len(c.Routes) == 0 {
+		return errors.New("no routes")
+	}
+	seen := map[string]bool{}
+	prios := map[int]string{}
+	for _, r := range c.Routes {
+		if !templateName.MatchString(r.Name) || seen[r.Name] {
+			return fmt.Errorf("route name %q: lowercase letters, digits and dashes, unique", r.Name)
+		}
+		seen[r.Name] = true
+		if strings.TrimSpace(r.Rule) == "" || r.Priority <= 0 {
+			return fmt.Errorf("route %s: rule and a positive priority are required", r.Name)
+		}
+		// The pinned router sits at priority+1: it must not tie or overtake another template.
+		for p, other := range prios {
+			if d := r.Priority - p; d >= -1 && d <= 1 {
+				return fmt.Errorf("routes %s and %s: priorities %d and %d leave no room for pinned routers (keep them at least 2 apart)", other, r.Name, p, r.Priority)
+			}
+		}
+		prios[r.Priority] = r.Name
+	}
+	return nil
 }
 
 type traefikDynamic struct {
@@ -64,30 +121,11 @@ type traefikServer struct {
 	URL string `json:"url"`
 }
 
-// Priorities: a pinned router must beat the default one for the same host.
-const (
-	priorityPinned  = 20000
-	priorityDefault = 10000
-)
-
 var nameUnsafe = regexp.MustCompile(`[^a-zA-Z0-9-]`)
 
 // TraefikConfig turns a routing table into Traefik dynamic configuration.
-func TraefikConfig(r *Routes, o TraefikOptions) traefikDynamic {
-	if o.Prefix == "" {
-		o.Prefix = "skew"
-	}
+func TraefikConfig(r *Routes, c RoutesConfig) traefikDynamic {
 	out := traefikDynamic{HTTP: traefikHTTP{Routers: map[string]traefikRouter{}, Services: map[string]traefikService{}}}
-	router := func(rule string, prio int, svc string) traefikRouter {
-		rt := traefikRouter{Rule: rule, Priority: prio, EntryPoints: o.EntryPoints, Middlewares: o.Middlewares, Service: svc}
-		switch {
-		case o.CertResolver != "":
-			rt.TLS = map[string]any{"certResolver": o.CertResolver}
-		case o.TLS:
-			rt.TLS = map[string]any{}
-		}
-		return rt
-	}
 	service := func(v *Version) traefikService {
 		lb := traefikLB{PassHostHeader: true, Servers: []traefikServer{}}
 		if v != nil && v.Upstream != nil {
@@ -95,32 +133,32 @@ func TraefikConfig(r *Routes, o TraefikOptions) traefikDynamic {
 		}
 		return traefikService{LoadBalancer: lb}
 	}
-	name := func(s string) string { return o.Prefix + "-" + nameUnsafe.ReplaceAllString(s, "-") }
-
-	// Default: unpinned traffic, unknown, retired and revoked ids.
-	def := name("default")
-	out.HTTP.Routers[def] = router(o.Rule, priorityDefault, def)
+	active := c.Prefix + "-active"
 	var serving *Version
+	var ids []string
 	if r != nil {
 		serving = r.Serving
-	}
-	out.HTTP.Services[def] = service(serving)
-
-	if r == nil {
-		return out
-	}
-	ids := make([]string, 0, len(r.byID))
-	for id := range r.byID {
-		ids = append(ids, id)
+		for id := range r.byID {
+			ids = append(ids, id)
+		}
 	}
 	sort.Strings(ids)
+	out.HTTP.Services[active] = service(serving)
 	for _, id := range ids {
-		v := r.byID[id]
-		n := name(id)
-		// Ids are valid label values (validID), so they can't break out of the backticks.
-		rule := fmt.Sprintf("(%s) && (Header(`%s`, `%s`) || Query(`dpl`, `%s`))", o.Rule, DeploymentIDHeader, id, id)
-		out.HTTP.Routers[n] = router(rule, priorityPinned, n)
-		out.HTTP.Services[n] = service(v)
+		out.HTTP.Services[c.Prefix+"-v-"+nameUnsafe.ReplaceAllString(id, "-")] = service(r.byID[id])
+	}
+
+	for _, t := range c.Routes {
+		router := func(rule string, prio int, svc string) traefikRouter {
+			return traefikRouter{Rule: rule, Priority: prio, EntryPoints: t.EntryPoints, Middlewares: t.Middlewares, Service: svc, TLS: t.TLS}
+		}
+		out.HTTP.Routers[c.Prefix+"-"+t.Name] = router(t.Rule, t.Priority, active)
+		for _, id := range ids {
+			n := c.Prefix + "-v-" + nameUnsafe.ReplaceAllString(id, "-")
+			// Ids are valid label values (validID), so they can't break out of the backticks.
+			rule := fmt.Sprintf("(%s) && (Header(`%s`, `%s`) || Query(`dpl`, `%s`))", t.Rule, DeploymentIDHeader, id, id)
+			out.HTTP.Routers[c.Prefix+"-"+t.Name+"-"+nameUnsafe.ReplaceAllString(id, "-")] = router(rule, t.Priority+1, n)
+		}
 	}
 	return out
 }

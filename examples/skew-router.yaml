@@ -1,21 +1,45 @@
 # skew-router: skew protection for a self-hosted Next.js app.
 #
-#   ingress ──▶ Service skew-router:8080 ──▶ Service web-<id>:3000 (one per web build)
+#   Traefik ──▶ Service web-<id>:3000 (one per web build)
+#      ▲
+#      └── routes from skew-router :9090/traefik (Traefik HTTP provider)
 #
 # A browser tab keeps talking to the web build that served it (it sends that build's id in
 # `x-deployment-id` / `?dpl=`); document navigations and ids of retired builds go to the ACTIVE
 # build, an explicit pointer kept in ConfigMap `web-routing`. The router discovers the versions
 # by label (web-version.yaml), moves the pointer to a newly promoted version once it has ready
-# endpoints (never to one without), and applies retention: the previous version stays routable
-# for -version-ttl after it stopped being active, then is scaled to 0 but kept (instant
-# rollback); anything beyond -max-versions is deleted. A version annotated revokes-older=true
-# revokes every older one the moment it is active and ready.
+# endpoints (never to one without), and applies retention. It carries no traffic: it serves
+# Traefik the routes, one per route template (skew-router-routes below) and per version.
 #
-# Every replica routes from cluster state alone; one (Lease leader election) writes the pointer
-# and the timers. RBAC is namespace-scoped and minimal. Kubernetes can't restrict a write to
-# objects with a label, so the router enforces it in code: it only patches or deletes a
-# Deployment/Service that carries the version label with the expected id, pinned to the UID it
-# checked.
+# Every replica serves the same routes; one (Lease leader election) writes the pointer and the
+# timers. RBAC is namespace-scoped and minimal. Kubernetes can't restrict a write to objects with
+# a label, so the router enforces it in code: it only patches or deletes a Deployment/Service
+# that carries the version label with the expected id, pinned to the UID it checked.
+#
+# Point Traefik at it (static configuration), and remove your own routes for the site:
+#   --providers.http.endpoint=http://skew-router.web.svc.cluster.local:9090/traefik
+#   --providers.http.pollInterval=2s
+---
+# The site's routes, as you'd write them in Traefik. Middlewares from the Kubernetes CRD
+# provider are named <namespace>-<name>@kubernetescrd.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: skew-router-routes
+  namespace: web
+data:
+  routes.json: |
+    {
+      "routes": [
+        { "name": "static", "priority": 500,
+          "rule": "Host(`www.example.com`) && PathPrefix(`/_next/static/`)",
+          "entryPoints": ["websecure"], "tls": {} },
+        { "name": "web", "priority": 100,
+          "rule": "Host(`www.example.com`)",
+          "entryPoints": ["websecure"], "tls": {} }
+      ]
+    }
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -122,11 +146,7 @@ spec:
           image: skew-router:v0.1.0
           imagePullPolicy: IfNotPresent
           args:
-            # Traefik mode: the router serves Traefik's routes and carries no traffic. Drop these
-            # three lines for proxy mode (and point your ingress at this Service instead).
-            - --mode=traefik
-            - --traefik-rule=Host(`www.example.com`)
-            - --traefik-entrypoints=websecure
+            - --routes=/etc/skew-router/routes.json
             - --version-ttl=1h
             - --max-versions=2
             - --drain=10s
@@ -154,10 +174,12 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           ports:
-            - name: http
-              containerPort: 8080
             - name: admin
               containerPort: 9090
+          volumeMounts:
+            - name: routes
+              mountPath: /etc/skew-router
+              readOnly: true
           lifecycle:
             preStop:
               sleep:
@@ -183,6 +205,10 @@ spec:
               memory: 32Mi
             limits:
               memory: 128Mi
+      volumes:
+        - name: routes
+          configMap:
+            name: skew-router-routes
 ---
 apiVersion: v1
 kind: Service
@@ -196,34 +222,10 @@ spec:
   selector:
     app: skew-router
   ports:
-    - name: http
-      port: 8080
-      targetPort: http
-      protocol: TCP
-    # Traefik health-checks the router here (/readyz) and fails over to
-    # web-fallback when no replica answers (see traefik-failover.yml).
+    # Traefik polls /traefik here; if no replica answers it keeps the last routes.
     - name: admin
       port: 9090
       targetPort: admin
-      protocol: TCP
----
-# Plan B when every skew-router replica is down: Traefik sends traffic straight
-# to the web pods (all versions alive, so a tab may land on another build —
-# Next then reloads it). Never a router version: no version label, so the
-# router ignores it, and nothing routes here while the router is healthy.
-apiVersion: v1
-kind: Service
-metadata:
-  name: web-fallback
-  namespace: web
-spec:
-  type: ClusterIP
-  selector:
-    app: web
-  ports:
-    - name: http
-      port: 3000
-      targetPort: 3000
       protocol: TCP
 ---
 apiVersion: policy/v1

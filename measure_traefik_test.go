@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"runtime"
 	"sort"
@@ -16,10 +15,13 @@ import (
 	"time"
 )
 
-// TestMeasureTraefik compares the two modes behind a real Traefik:
+// TestMeasureTraefik checks the generated routes against a real Traefik, then measures them.
 //
-//	proxy:   Traefik → skew-router → version
-//	traefik: Traefik → version (the router only serves Traefik's routes)
+// Correctness: two route templates, a static-assets one (priority 500) and a catch-all (100),
+// each with its own middleware that stamps the response (X-Route: static / web). A pinned
+// request must reach its version AND keep its template's middleware.
+//
+// Throughput: skew routes vs a plain Traefik route straight to the version (no skew protection).
 //
 // Run Traefik first, on the host network, polling this test's config endpoint:
 //
@@ -46,15 +48,34 @@ func TestMeasureTraefik(t *testing.T) {
 		newVersion(t, "web-new", "new222", t0.Add(time.Minute), newSrv, true))
 	h.reconcile()
 
-	// The config the router serves in traefik mode, plus one extra router that sends
-	// Host(router.test) through the router itself: the proxy-mode path, through the same Traefik.
-	opts := TraefikOptions{Rule: "Host(`app.test`)", EntryPoints: []string{"bench"}}
+	rc := RoutesConfig{Routes: []RouteTemplate{
+		{Name: "static", Rule: "Host(`app.test`) && PathPrefix(`/_next/static/`)", Priority: 500, EntryPoints: []string{"bench"}, Middlewares: []string{"mark-static"}},
+		{Name: "web", Rule: "Host(`app.test`)", Priority: 100, EntryPoints: []string{"bench"}, Middlewares: []string{"mark-web"}},
+	}}
+	if err := rc.validate(); err != nil {
+		t.Fatal(err)
+	}
+	type mw struct {
+		Headers struct {
+			CustomResponseHeaders map[string]string `json:"customResponseHeaders"`
+		} `json:"headers"`
+	}
+	stamp := func(v string) mw {
+		var m mw
+		m.Headers.CustomResponseHeaders = map[string]string{"X-Route": v}
+		return m
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /traefik", func(w http.ResponseWriter, _ *http.Request) {
-		c := TraefikConfig(h.ctrl.Routes(), opts)
-		c.HTTP.Routers["via-router"] = traefikRouter{Rule: "Host(`router.test`)", Priority: 1, EntryPoints: []string{"bench"}, Service: "via-router"}
-		c.HTTP.Services["via-router"] = traefikService{LoadBalancer: traefikLB{PassHostHeader: true, Servers: []traefikServer{{URL: h.router.URL}}}}
-		_ = json.NewEncoder(w).Encode(c)
+		c := TraefikConfig(h.ctrl.Routes(), rc)
+		// The baseline: the same Traefik, straight to the active version, no skew routes.
+		c.HTTP.Routers["baseline"] = traefikRouter{Rule: "Host(`base.test`)", Priority: 1, EntryPoints: []string{"bench"}, Service: "baseline"}
+		c.HTTP.Services["baseline"] = traefikService{LoadBalancer: traefikLB{PassHostHeader: true, Servers: []traefikServer{{URL: newSrv.URL}}}}
+		out := map[string]any{"http": map[string]any{
+			"routers": c.HTTP.Routers, "services": c.HTTP.Services,
+			"middlewares": map[string]mw{"mark-static": stamp("static"), "mark-web": stamp("web")},
+		}}
+		_ = json.NewEncoder(w).Encode(out)
 	})
 	l, err := net.Listen("tcp", "127.0.0.1:19090")
 	if err != nil {
@@ -73,11 +94,9 @@ func TestMeasureTraefik(t *testing.T) {
 		}
 		return client.Do(req)
 	}
-	// Wait until Traefik has loaded the routes, and check they route like the proxy does.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		res, err := get("app.test", "/", map[string]string{DeploymentIDHeader: "old111"})
-		if err == nil {
+		if res, err := get("app.test", "/", map[string]string{DeploymentIDHeader: "old111"}); err == nil {
 			res.Body.Close()
 			if res.Header.Get("X-Version") == "old" {
 				break
@@ -88,29 +107,38 @@ func TestMeasureTraefik(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	check := func(host, path string, hdr map[string]string, want string) {
-		res, err := get(host, path, hdr)
+	for _, c := range []struct {
+		path        string
+		hdr         map[string]string
+		version     string
+		route       string
+		description string
+	}{
+		{"/", nil, "new", "web", "document load → active, catch-all middleware"},
+		{"/", map[string]string{DeploymentIDHeader: "old111"}, "old", "web", "pinned navigation → its version, catch-all middleware"},
+		{"/_next/static/chunk.js?dpl=old111", nil, "old", "static", "pinned asset → its version, static middleware"},
+		{"/_next/static/chunk.js", nil, "new", "static", "unpinned asset → active, static middleware"},
+		{"/", map[string]string{DeploymentIDHeader: "gone99"}, "new", "web", "unknown id → active"},
+	} {
+		res, err := get("app.test", c.path, c.hdr)
 		if err != nil {
 			t.Fatal(err)
 		}
 		res.Body.Close()
-		if got := res.Header.Get("X-Version"); got != want {
-			t.Fatalf("%s %s %v → %q, want %q", host, path, hdr, got, want)
+		if res.Header.Get("X-Version") != c.version || res.Header.Get("X-Route") != c.route {
+			t.Fatalf("%s: got version %q route %q", c.description, res.Header.Get("X-Version"), res.Header.Get("X-Route"))
 		}
+		fmt.Printf("ok  %s\n", c.description)
 	}
-	check("app.test", "/", nil, "new")                                             // unpinned → active
-	check("app.test", "/x.js?dpl=old111", nil, "old")                              // pinned by query
-	check("app.test", "/", map[string]string{DeploymentIDHeader: "gone99"}, "new") // unknown → active
-	check("router.test", "/", map[string]string{DeploymentIDHeader: "old111"}, "old")
 
 	fmt.Printf("\n%s/%s, %d CPUs, %d requests per case, 32 concurrent clients, through Traefik\n", runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), n)
-	fmt.Printf("%-40s %10s %9s %9s\n", "path", "req/s", "p50", "p99")
+	fmt.Printf("%-44s %10s %9s %9s\n", "path", "req/s", "p50", "p99")
 	for _, c := range []struct {
 		name, host string
 		hdr        map[string]string
 	}{
-		{"traefik mode: Traefik → version", "app.test", map[string]string{DeploymentIDHeader: "old111"}},
-		{"proxy mode: Traefik → router → version", "router.test", map[string]string{DeploymentIDHeader: "old111"}},
+		{"Traefik → version, no skew protection", "base.test", nil},
+		{"Traefik → version, skew routes (pinned)", "app.test", map[string]string{DeploymentIDHeader: "old111"}},
 	} {
 		const workers = 32
 		per := n / workers
@@ -143,7 +171,8 @@ func TestMeasureTraefik(t *testing.T) {
 		}
 		sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
 		q := func(p float64) time.Duration { return all[int(float64(len(all)-1)*p)] }
-		fmt.Printf("%-40s %10.0f %9s %9s\n", c.name, float64(len(all))/el.Seconds(), us(q(0.5)), us(q(0.99)))
+		fmt.Printf("%-44s %10.0f %9s %9s\n", c.name, float64(len(all))/el.Seconds(), us(q(0.5)), us(q(0.99)))
 	}
-	_ = url.URL{}
 }
+
+func us(d time.Duration) string { return fmt.Sprintf("%.0f µs", float64(d.Microseconds())) }

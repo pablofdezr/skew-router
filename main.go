@@ -41,7 +41,7 @@ import (
 )
 
 type config struct {
-	listen, adminListen    string
+	adminListen            string
 	kubeconfig, namespace  string
 	selector, versionLabel string
 	port                   string
@@ -53,15 +53,13 @@ type config struct {
 	leaseName, identity    string
 	annotationPrefix       string
 	pointerConfigMap       string
-	mode                   string // proxy | traefik
-	traefik                TraefikOptions
+	routes                 RoutesConfig // the Traefik routes to generate
 }
 
 func parseFlags(args []string) (config, error) {
 	var c config
 	fs := flag.NewFlagSet("skew-router", flag.ContinueOnError)
-	fs.StringVar(&c.listen, "listen", ":8080", "proxy listen address")
-	fs.StringVar(&c.adminListen, "admin-listen", ":9090", "health/metrics listen address (not exposed publicly)")
+	fs.StringVar(&c.adminListen, "admin-listen", ":9090", "address of /traefik (Traefik's HTTP provider), health and metrics; keep it private")
 	fs.StringVar(&c.kubeconfig, "kubeconfig", "", "kubeconfig path (default: in-cluster config)")
 	fs.StringVar(&c.namespace, "namespace", envOr("POD_NAMESPACE", "default"), "namespace of the web versions")
 	fs.StringVar(&c.selector, "selector", "app=web", "label selector of web version Services")
@@ -75,28 +73,42 @@ func parseFlags(args []string) (config, error) {
 	fs.DurationVar(&c.resync, "reconcile-interval", 5*time.Second, "periodic reconcile (TTL expiry), on top of watch events")
 	fs.DurationVar(&c.shutdownDelay, "shutdown-delay", 3*time.Second, "on SIGTERM, keep serving this long (unready) before closing listeners")
 	fs.BoolVar(&c.dryRun, "dry-run", false, "log deletions instead of performing them")
-	fs.StringVar(&c.mode, "mode", "proxy", "proxy: requests go through the router; traefik: the router serves Traefik routes on the admin port (/traefik) and carries no traffic")
-	fs.StringVar(&c.traefik.Rule, "traefik-rule", "", "traefik mode: the site's Traefik rule, e.g. Host(`www.example.com`)")
-	var eps, mws string
-	fs.StringVar(&eps, "traefik-entrypoints", "websecure", "traefik mode: entrypoints, comma-separated")
-	fs.StringVar(&mws, "traefik-middlewares", "", "traefik mode: middlewares for every router, comma-separated")
-	fs.StringVar(&c.traefik.CertResolver, "traefik-certresolver", "", "traefik mode: TLS certificate resolver")
-	fs.BoolVar(&c.traefik.TLS, "traefik-tls", false, "traefik mode: TLS with the default certificate (when no resolver)")
+	var routesFile, rule, eps, mws, resolver string
+	var tls bool
+	fs.StringVar(&routesFile, "routes", "", "JSON file with the route templates (see README); or a single route with -traefik-rule")
+	fs.StringVar(&rule, "traefik-rule", "", "single route: the site's Traefik rule, e.g. Host(`www.example.com`)")
+	fs.StringVar(&eps, "traefik-entrypoints", "websecure", "single route: entrypoints, comma-separated")
+	fs.StringVar(&mws, "traefik-middlewares", "", "single route: middlewares, comma-separated")
+	fs.StringVar(&resolver, "traefik-certresolver", "", "single route: TLS certificate resolver")
+	fs.BoolVar(&tls, "traefik-tls", false, "single route: TLS with the default certificate (when no resolver)")
 	fs.BoolVar(&c.leaderElect, "leader-elect", true, "only the Lease holder writes retention annotations and deletes versions (all replicas route)")
 	fs.StringVar(&c.leaseName, "lease-name", "skew-router", "coordination.k8s.io Lease used for leader election")
 	fs.StringVar(&c.identity, "identity", envOr("POD_NAME", hostname()), "leader election identity")
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
-	c.traefik.EntryPoints, c.traefik.Middlewares = splitCSV(eps), splitCSV(mws)
-	switch c.mode {
-	case "proxy":
-	case "traefik":
-		if c.traefik.Rule == "" {
-			return c, errors.New("-mode=traefik needs -traefik-rule")
+	switch {
+	case routesFile != "" && rule != "":
+		return c, errors.New("use -routes or -traefik-rule, not both")
+	case routesFile != "":
+		rc, err := LoadRoutes(routesFile)
+		if err != nil {
+			return c, fmt.Errorf("-routes: %w", err)
+		}
+		c.routes = rc
+	case rule != "":
+		t := RouteTemplate{Name: "web", Rule: rule, Priority: 100, EntryPoints: splitCSV(eps), Middlewares: splitCSV(mws)}
+		if resolver != "" {
+			t.TLS = map[string]any{"certResolver": resolver}
+		} else if tls {
+			t.TLS = map[string]any{}
+		}
+		c.routes = RoutesConfig{Routes: []RouteTemplate{t}}
+		if err := c.routes.validate(); err != nil {
+			return c, err
 		}
 	default:
-		return c, fmt.Errorf("-mode %q: proxy or traefik", c.mode)
+		return c, errors.New("-routes or -traefik-rule is required")
 	}
 	if c.annotationPrefix == "" || c.pointerConfigMap == "" {
 		return c, errors.New("-annotation-prefix and -pointer-configmap must not be empty")
@@ -187,31 +199,19 @@ func run(log *slog.Logger) error {
 	}
 
 	var shuttingDown atomic.Bool
-	proxySrv := &http.Server{
-		Addr:              cfg.listen,
-		Handler:           NewProxy(ctrl.Routes, metrics, log),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    1 << 20,
-		// No Read/WriteTimeout: uploads and streamed responses (RSC, SSE)
-		// may legitimately run long. Upstream hangs are bounded by the
-		// transport's ResponseHeaderTimeout.
-	}
 	adminSrv := &http.Server{
 		Addr:              cfg.adminListen,
-		Handler:           adminMux(ctrl, metrics, &shuttingDown, cfg.traefik),
+		Handler:           adminMux(ctrl, metrics, &shuttingDown, cfg.routes),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errc := make(chan error, 2)
-	for _, s := range []*http.Server{proxySrv, adminSrv} {
-		go func(s *http.Server) {
-			if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- err
-			}
-		}(s)
-	}
-	log.Info("skew-router started", "mode", cfg.mode, "listen", cfg.listen, "namespace", cfg.namespace,
+	errc := make(chan error, 1)
+	go func() {
+		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errc <- err
+		}
+	}()
+	log.Info("skew-router started", "admin", cfg.adminListen, "routes", len(cfg.routes.Routes), "namespace", cfg.namespace,
 		"ttl", cfg.ttl.String(), "max_versions", cfg.maxVersions, "dry_run", cfg.dryRun)
 
 	select {
@@ -220,18 +220,14 @@ func run(log *slog.Logger) error {
 	case <-ctx.Done():
 	}
 
-	// Graceful stop: report unready so the Service drops this pod, keep
-	// serving through the delay (endpoint removal propagates), then stop
-	// accepting and let in-flight requests finish. Hijacked connections
-	// (WebSockets) are not waited for; their clients reconnect.
+	// Graceful stop: report unready so the Service drops this pod and Traefik's next poll
+	// reaches another replica, keep answering through the delay, then stop.
 	shuttingDown.Store(true)
 	log.Info("shutting down", "delay", cfg.shutdownDelay.String())
 	time.Sleep(cfg.shutdownDelay)
-	sctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err = proxySrv.Shutdown(sctx)
-	_ = adminSrv.Shutdown(sctx)
-	return err
+	return adminSrv.Shutdown(sctx)
 }
 
 func kubeClient(kubeconfig string) (kubernetes.Interface, error) {
@@ -254,21 +250,19 @@ func kubeClient(kubeconfig string) (kubernetes.Interface, error) {
 // adminMux serves the probes, metrics and a JSON view of the routing
 // table. It listens on its own port, never reachable through Traefik
 // (paths like /healthz on the public port belong to the web app).
-func adminMux(ctrl *Controller, m *Metrics, shuttingDown *atomic.Bool, tr TraefikOptions) *http.ServeMux {
+func adminMux(ctrl *Controller, m *Metrics, shuttingDown *atomic.Bool, rc RoutesConfig) *http.ServeMux {
 	mux := http.NewServeMux()
-	// Traefik's HTTP provider polls this (-mode=traefik). Served before the first table is built
-	// only as a 503, so Traefik keeps what it had instead of loading an empty config.
-	if tr.Rule != "" {
-		mux.HandleFunc("GET /traefik", func(w http.ResponseWriter, _ *http.Request) {
-			r := ctrl.Routes()
-			if r == nil {
-				http.Error(w, "routing table not built yet", http.StatusServiceUnavailable)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(TraefikConfig(r, tr))
-		})
-	}
+	// Traefik's HTTP provider polls this. Before the first table is built it answers 503, so
+	// Traefik keeps what it had instead of loading an empty config.
+	mux.HandleFunc("GET /traefik", func(w http.ResponseWriter, _ *http.Request) {
+		r := ctrl.Routes()
+		if r == nil {
+			http.Error(w, "routing table not built yet", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(TraefikConfig(r, rc))
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
