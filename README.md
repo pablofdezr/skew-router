@@ -122,6 +122,20 @@ sync.
   `skew_router_versions_retired_total`, `skew_router_versions_revoked_total`.
 - JSON logs on stdout.
 
+## Overhead
+
+`SKEW_BENCH=1 go test -run TestMeasureOverhead -v` measures it: the same request straight to a
+version and through the router, on loopback, 10,000 sequential requests per case.
+
+| Machine | Direct, p50 | Router, p50 | Router, p99 |
+| --- | --- | --- | --- |
+| Apple M1 Pro | 42 µs | 100 to 110 µs | 297 to 391 µs |
+| 4 vCPU AMD EPYC (Hetzner, other workloads running) | 155 µs | 268 to 371 µs | 714 to 881 µs |
+
+`Pick` (the routing decision) is 6.6 ns and reading the id about 0.5 µs (`go test -bench .`):
+the cost is the extra proxy hop. With 32 concurrent clients on the 4 vCPU box the router served
+about 19,500 req/s against 66,500 direct, with client, router and backend sharing four cores.
+
 ## Limits
 
 - **It costs a second set of pods** for up to `-version-ttl` after every deploy.
