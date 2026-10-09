@@ -12,7 +12,7 @@ ingress ──▶ skew-router :8080 ──▶ Service web-<id> :3000   (one Depl
 it inside your cluster: a small Go proxy (client-go informers, no other dependencies) that sits
 between the ingress and one Service per web build.
 
-The story behind it: [Two Builds, One Tab](https://www.pablofr.com/blog/two-builds-one-tab).
+The story behind it: [Two Builds, One Address](https://www.pablofr.com/blog/two-builds-one-address).
 
 ## How it routes
 
