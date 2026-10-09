@@ -32,6 +32,35 @@ The **active version** is an explicit pointer in a ConfigMap (`web-routing`), no
 pod". A deploy only stamps the new version as promoted; the router moves the pointer once that
 version has ready endpoints, and never to one without.
 
+## Two modes
+
+- **`-mode=proxy`** (default): requests go ingress → skew-router → version. Simplest to set up,
+  and the router counts every routing outcome in its own metrics.
+- **`-mode=traefik`**: the router carries no traffic. It serves Traefik's HTTP provider on the
+  admin port (`GET /traefik`): one router per routable version matching its id in the
+  `x-deployment-id` header or `?dpl=`, and a lower-priority default router to the serving
+  version. Traefik then sends each request straight to its version, with no extra hop.
+
+```yaml
+# Traefik static configuration
+providers:
+  http:
+    endpoint: http://skew-router.web.svc.cluster.local:9090/traefik
+    pollInterval: 2s
+```
+
+```sh
+skew-router -mode=traefik -traefik-rule='Host(`www.example.com`)' \
+  -traefik-entrypoints=websecure -traefik-certresolver=le
+```
+
+Pointer moves, retention and revocation work the same; Traefik picks them up on its next poll.
+Every replica serves the same configuration, and if every replica is down Traefik keeps the last
+configuration it fetched, so routing goes on (frozen) until one is back. That's tested, not
+assumed: with the endpoint gone for 8 s, Traefik kept answering 200. The trade: outcome metrics
+move to Traefik's per-router metrics (router names carry the version id), and a pointer move
+takes up to one poll interval to apply.
+
 ## Retention
 
 - **The previous version stays routable** for `-version-ttl` (default 1 h) after it stopped being
@@ -123,6 +152,18 @@ sync.
 - JSON logs on stdout.
 
 ## Overhead
+
+Behind a real Traefik on a 4 vCPU AMD EPYC box (Traefik, router, backend and load generator
+sharing the four cores; 32 concurrent clients; `TestMeasureTraefik`):
+
+| Path | req/s | p50 | p99 |
+| --- | --- | --- | --- |
+| `-mode=traefik`: Traefik → version | 20,975 | 1.2 ms | 5.6 ms |
+| `-mode=proxy`: Traefik → router → version | 10,668 | 2.6 ms | 8.5 ms |
+
+Dropping the hop doubles throughput; in traefik mode the ceiling is Traefik's own.
+
+### The proxy on its own
 
 `SKEW_BENCH=1 go test -run TestMeasureOverhead -v` measures it: the same request straight to a
 version and through the router, on loopback, 10,000 sequential requests per case.

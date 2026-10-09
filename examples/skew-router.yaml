@@ -122,6 +122,11 @@ spec:
           image: skew-router:v0.1.0
           imagePullPolicy: IfNotPresent
           args:
+            # Traefik mode: the router serves Traefik's routes and carries no traffic. Drop these
+            # three lines for proxy mode (and point your ingress at this Service instead).
+            - --mode=traefik
+            - --traefik-rule=Host(`www.example.com`)
+            - --traefik-entrypoints=websecure
             - --version-ttl=1h
             - --max-versions=2
             - --drain=10s
